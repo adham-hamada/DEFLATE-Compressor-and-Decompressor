@@ -168,6 +168,88 @@ def stage2_compress(data):
     s2_compressed.append(('end',256))
     return s2_compressed
 
+#==============================================================
+#========Stage 3: Canonical Huffman Coding=====================
+#==============================================================
+
+def get_frequencies(s2_compressed):
+    lit_freq = [0] * 286
+    dist_freq = [0] * 30
+    for item in s2_compressed:
+        if item[0] == 'literal':
+            lit_freq[item[1]] += 1
+        elif item[0] == 'match':
+            lit_freq[item[1]] += 1   
+            dist_freq[item[3]] += 1  
+        elif item[0] == 'end':
+            lit_freq[item[1]] += 1
+    return lit_freq, dist_freq
+
+def build_huffman_tree(freq):
+    import heapq
+    heap = [(w, s, [[s, ""]]) for s, w in enumerate(freq) if w > 0]
+    heapq.heapify(heap)
+    while len(heap) > 1:
+        w1, m1, p1 = heapq.heappop(heap)
+        w2, m2, p2 = heapq.heappop(heap)
+        for pair in p1: pair[1] = '0' + pair[1]
+        for pair in p2: pair[1] = '1' + pair[1]
+        heapq.heappush(heap, (w1 + w2, min(m1, m2), p1 + p2))
+    return sorted(heap[0][2], key=lambda x: (len(x[1]), x[0]))
+
+def get_huffman_lengths(freq):
+    tree = build_huffman_tree(freq)
+    if not tree:
+        return [0] * len(freq)
+    lengths = [0] * len(freq)
+    for symbol, code in tree:
+        lengths[symbol] = max(len(code), 1)
+    return lengths
+
+def get_huffman_codes(freq):
+    lengths = get_huffman_lengths(freq)
+    count = [0] * 16
+    for length in lengths:
+        count[length] += 1
+    count[0] = 0
+    next_code = [0] * 16
+    code = 0
+    for bits in range(1, 16):
+        code = (code + count[bits - 1]) << 1
+        next_code[bits] = code
+    symbol_code = {}
+    for symbol in range(len(lengths)):
+        length = lengths[symbol]
+        if length != 0:
+            symbol_code[symbol] = (next_code[length], length)  # return (code, length)
+            next_code[length] += 1
+    return symbol_code
+
+def stage3_compress(s2_compressed):
+    lit_freq, dist_freq = get_frequencies(s2_compressed)
+    lit_codes = get_huffman_codes(lit_freq)
+    dist_codes = get_huffman_codes(dist_freq)
+    s3_compressed = []
+    for item in s2_compressed:
+        if item[0] == 'literal':
+            code, length = lit_codes[item[1]]
+            s3_compressed.append(('literal', item[1], code, length))
+        elif item[0] == 'match':
+            len_sym, len_extra, dist_sym, dist_extra = item[1], item[2], item[3], item[4]
+            length_huff_code, length_huff_len = lit_codes[len_sym]
+            dist_huff_code, dist_huff_len = dist_codes[dist_sym]
+            s3_compressed.append((
+                'match',
+                len_sym, len_extra,
+                dist_sym, dist_extra,
+                length_huff_code, length_huff_len,
+                dist_huff_code, dist_huff_len
+            ))
+        elif item[0] == 'end':
+            code, length = lit_codes[item[1]]
+            s3_compressed.append(('end', item[1], code, length))
+    return s3_compressed
+
 # Example usage
 if __name__ == "__main__":
     data = b"abcabcabcabc"
@@ -187,3 +269,12 @@ if __name__ == "__main__":
             print(f"MatchEvent({item[1]}, \"{item[2]}\", {item[3]}, \"{item[4]}\")")
         elif item[0] == 'end':
             print(f"EndEvent({item[1]})")
+    s3_compressed = stage3_compress(s2_compressed)
+    print("\nStage 3 Compressed Data:")
+    for item in s3_compressed:
+        if item[0] == 'literal':
+            print(f"LiteralEvent({item[1]}, code={item[2]}, length={item[3]})")
+        elif item[0] == 'match':
+            print(f"MatchEvent(len_sym={item[1]}, len_extra=\"{item[2]}\", dist_sym={item[3]}, dist_extra=\"{item[4]}\", length_code={item[5]}, length_bits={item[6]}, dist_code={item[7]}, dist_bits={item[8]})")
+        elif item[0] == 'end':
+            print(f"EndEvent({item[1]}, code={item[2]}, length={item[3]})")
