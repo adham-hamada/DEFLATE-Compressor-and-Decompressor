@@ -7,6 +7,8 @@ MIN_MATCH = 3
 MAX_MATCH = 258
 MAX_CANDIDATES = 64
 
+import math
+import sys
 import numpy as np
 
 sliding_window = np.zeros(WINDOW_SIZE, dtype=np.uint8)
@@ -60,7 +62,7 @@ def stage1compress(data):
                 while length < max_len and data[candidate + length] == data[i + length]:
                     length += 1
 
-                if length > best_length:
+                if length > best_length or (length == best_length and distance < best_distance):
                     best_length = length
                     best_distance = distance
 
@@ -188,6 +190,8 @@ def get_frequencies(s2_compressed):
 def build_huffman_tree(freq):
     import heapq
     heap = [(w, s, [[s, ""]]) for s, w in enumerate(freq) if w > 0]
+    if not heap:
+        return []
     heapq.heapify(heap)
     while len(heap) > 1:
         w1, m1, p1 = heapq.heappop(heap)
@@ -250,31 +254,232 @@ def stage3_compress(s2_compressed):
             s3_compressed.append(('end', item[1], code, length))
     return s3_compressed
 
-# Example usage
-if __name__ == "__main__":
-    data = b"abcabcabcabc"
-    s1_compressed = stage1compress(data)
-    print("Stage 1 Compressed Data:")
-    for item in s1_compressed:
-        if item[0] == 'literal':
-            print(f"Literal({item[1]})")
-        elif item[0] == 'match':
-            print(f"Match(length={item[1]}, distance={item[2]})")
-    s2_compressed = stage2_compress(data)
-    print("\nStage 2 Compressed Data:")
-    for item in s2_compressed:
-        if item[0] == 'literal':
-            print(f"LiteralEvent({item[1]})")
-        elif item[0] == 'match':
-            print(f"MatchEvent({item[1]}, \"{item[2]}\", {item[3]}, \"{item[4]}\")")
-        elif item[0] == 'end':
-            print(f"EndEvent({item[1]})")
-    s3_compressed = stage3_compress(s2_compressed)
-    print("\nStage 3 Compressed Data:")
+#==============================================================
+#========Stage 4: Custom Header and Payload===================
+#==============================================================
+class BitWriter:
+    """Accumulates bits (MSB-first) and exposes them as a bytearray."""
+
+    def __init__(self):
+        self.buffer = bytearray()
+        self.current_byte = 0
+        self.bits_in_byte = 0  # how many bits have been written into current_byte
+
+    def write_bits(self, value, num_bits):
+        """Write `num_bits` bits of `value`, MSB first."""
+        for i in range(num_bits - 1, -1, -1):
+            bit = (value >> i) & 1
+            self.current_byte = (self.current_byte << 1) | bit
+            self.bits_in_byte += 1
+            if self.bits_in_byte == 8:
+                self.buffer.append(self.current_byte)
+                self.current_byte = 0
+                self.bits_in_byte = 0
+    def write_bit_string(self, bit_string):
+        """Write a string of '0'/'1' characters (used for raw extra bits)."""
+        for ch in bit_string:
+            self.write_bits(int(ch), 1)
+    def flush(self):        
+        """Pad the last byte with zeros and flush it."""
+        if self.bits_in_byte > 0:
+            self.current_byte <<= (8 - self.bits_in_byte)
+            self.buffer.append(self.current_byte)
+            self.current_byte = 0
+            self.bits_in_byte = 0
+    def get_bytes(self):        return bytes(self.buffer)
+def compute_bit_width(code_lengths):
+    """BW = 0          if max(code_lengths) == 0
+         floor(log2(M)) + 1   otherwise
+    """
+    M = max(code_lengths) if code_lengths else 0
+    if M == 0:
+        return 0
+    return math.floor(math.log2(M)) + 1
+def get_code_length_tables(lit_codes, dist_codes):
+    lit_lengths = [0] * 286
+    for symbol, (code, length) in lit_codes.items():
+        lit_lengths[symbol] = length
+
+    dist_lengths = [0] * 30
+    for symbol, (code, length) in dist_codes.items():
+        dist_lengths[symbol] = length
+
+    return lit_lengths, dist_lengths
+    
+def stage4_compress(s3_compressed, lit_codes, dist_codes):
+    """
+    Produce the final compressed byte string.
+
+    Parameters
+    ----------
+    s3_compressed : list
+        Output of stage3_compress().
+        Each element is one of:
+          ('literal', symbol, huff_code, huff_len)
+          ('match',   len_sym, len_extra_str,
+                      dist_sym, dist_extra_str,
+                      len_huff_code,  len_huff_len,
+                      dist_huff_code, dist_huff_len)
+          ('end',     256, huff_code, huff_len)
+    lit_codes  : dict  { symbol -> (code_int, length) }
+    dist_codes : dict  { symbol -> (code_int, length) }
+
+    Returns
+    -------
+    bytes
+    """
+    lit_lengths, dist_lengths = get_code_length_tables(lit_codes, dist_codes)
+
+    lit_bw  = compute_bit_width(lit_lengths)
+    dist_bw = compute_bit_width(dist_lengths)
+
+    bw = BitWriter()
+
+    # ── Header ────────────────────────────────────────────────
+    # LIT_BW  (4 bits)
+    bw.write_bits(lit_bw, 4)
+    # DIST_BW (4 bits)
+    bw.write_bits(dist_bw, 4)
+
+    # LIT_TABLE: 286 entries, each lit_bw bits wide
+    for length in lit_lengths:
+        bw.write_bits(length, lit_bw)
+
+    # DIST_TABLE: 30 entries, each dist_bw bits wide (omitted when dist_bw == 0)
+    if dist_bw > 0:
+        for length in dist_lengths:
+            bw.write_bits(length, dist_bw)
+
+    # ── Payload ───────────────────────────────────────────────
     for item in s3_compressed:
         if item[0] == 'literal':
-            print(f"LiteralEvent({item[1]}, code={item[2]}, length={item[3]})")
+            _, symbol, huff_code, huff_len = item
+            bw.write_bits(huff_code, huff_len)
+
         elif item[0] == 'match':
-            print(f"MatchEvent(len_sym={item[1]}, len_extra=\"{item[2]}\", dist_sym={item[3]}, dist_extra=\"{item[4]}\", length_code={item[5]}, length_bits={item[6]}, dist_code={item[7]}, dist_bits={item[8]})")
+            (_, len_sym,  len_extra_str,
+                dist_sym, dist_extra_str,
+                len_huff_code,  len_huff_len,
+                dist_huff_code, dist_huff_len) = item
+
+            # Huffman(len_sym)
+            bw.write_bits(len_huff_code, len_huff_len)
+            # len_extra  (raw bits, may be empty string)
+            bw.write_bit_string(len_extra_str)
+            # Huffman(dist_sym)
+            bw.write_bits(dist_huff_code, dist_huff_len)
+            # dist_extra (raw bits, may be empty string)
+            bw.write_bit_string(dist_extra_str)
+
         elif item[0] == 'end':
-            print(f"EndEvent({item[1]}, code={item[2]}, length={item[3]})")
+            _, symbol, huff_code, huff_len = item
+            bw.write_bits(huff_code, huff_len)
+
+    # Pad the last byte with zeros
+    bw.flush()
+
+    return bw.get_bytes()
+
+def compress(data):
+    """
+    Run all four stages and return the final compressed bytes.
+
+    Placeholder calls for stage functions that live in other modules:
+        stage2_compress(data)       -- defined in stage 1/2 file
+        stage3_compress(s2)         -- defined in stage 3 file
+        get_huffman_codes(freq)     -- defined in stage 3 file
+        get_frequencies(s2)         -- defined in stage 3 file
+    """
+    s2_compressed = stage2_compress(data)           # PLACEHOLDER: import from stage 2
+    s3_compressed = stage3_compress(s2_compressed)  # PLACEHOLDER: import from stage 3
+
+    # Rebuild the code dicts so stage4 can build the header tables
+    lit_freq, dist_freq = get_frequencies(s2_compressed)   # PLACEHOLDER
+    lit_codes  = get_huffman_codes(lit_freq)                # PLACEHOLDER
+    dist_codes = get_huffman_codes(dist_freq)               # PLACEHOLDER
+
+    return stage4_compress(s3_compressed, lit_codes, dist_codes)
+
+
+#==============================================================
+#========CLI Entry Point=======================================
+#==============================================================
+ 
+# FIX Bug 3: The original __main__ only ran a hardcoded test and had no
+# argument handling.  The spec requires:
+#   python main.py -c <file>   → compress, write <file>.sdfl
+#   python main.py -d <file>   → decompress, write original filename
+ 
+if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == '-c':
+        input_path  = sys.argv[2]
+        output_path = input_path + '.sdfl'
+        with open(input_path, 'rb') as f:
+            data = f.read()
+        compressed = compress(data)
+        with open(output_path, 'wb') as f:
+            f.write(compressed)
+        print(f"Compressed '{input_path}' → '{output_path}' "
+              f"({len(data)} bytes → {len(compressed)} bytes)")
+ 
+    elif len(sys.argv) == 3 and sys.argv[1] == '-d':
+        input_path = sys.argv[2]
+        if not input_path.endswith('.sdfl'):
+            print("Error: file to decompress must have .sdfl extension", file=sys.stderr)
+            sys.exit(1)
+        output_path = input_path[:-5]   # strip '.sdfl'
+        with open(input_path, 'rb') as f:
+            data = f.read()
+        # Decompressor will be implemented in a later stage
+        raise NotImplementedError("Decompression (Stage 5) not yet implemented.")
+ 
+    else:
+        # ── Developer smoke-test (no arguments) ──────────────
+        print("Usage: python main.py -c <file>  |  python main.py -d <file>.sdfl")
+        print()
+ 
+        data = b"abcabcabcabc"
+        s1 = stage1compress(data)
+        print("Stage 1:")
+        for item in s1:
+            if item[0] == 'literal':
+                print(f"  Literal({item[1]})")
+            else:
+                print(f"  Match(length={item[1]}, distance={item[2]})")
+ 
+        s2 = stage2_compress(data)
+        print("\nStage 2:")
+        for item in s2:
+            if item[0] == 'literal':
+                print(f"  LiteralEvent({item[1]})")
+            elif item[0] == 'match':
+                print(f"  MatchEvent({item[1]}, \"{item[2]}\", {item[3]}, \"{item[4]}\")")
+            elif item[0] == 'end':
+                print(f"  EndEvent({item[1]})")
+ 
+        s3 = stage3_compress(s2)
+        print("\nStage 3:")
+        for item in s3:
+            if item[0] == 'literal':
+                print(f"  LiteralEvent({item[1]}, code={item[2]}, len={item[3]})")
+            elif item[0] == 'match':
+                print(f"  MatchEvent(len_sym={item[1]}, len_extra=\"{item[2]}\", "
+                      f"dist_sym={item[3]}, dist_extra=\"{item[4]}\", "
+                      f"len_code={item[5]}, len_bits={item[6]}, "
+                      f"dist_code={item[7]}, dist_bits={item[8]})")
+            elif item[0] == 'end':
+                print(f"  EndEvent({item[1]}, code={item[2]}, len={item[3]})")
+ 
+        lit_freq, dist_freq = get_frequencies(s2)
+        lit_codes  = get_huffman_codes(lit_freq)
+        dist_codes = get_huffman_codes(dist_freq)
+        compressed = stage4_compress(s3, lit_codes, dist_codes)
+ 
+        print(f"\nStage 4:")
+        print(f"  Input : {data}")
+        print(f"  Output: {compressed.hex()}")
+        print(f"  Bytes : {len(compressed)} (input was {len(data)})")
+ 
+        lit_lengths, dist_lengths = get_code_length_tables(lit_codes, dist_codes)
+        print(f"  LIT_BW={compute_bit_width(lit_lengths)}, "
+              f"DIST_BW={compute_bit_width(dist_lengths)}")
