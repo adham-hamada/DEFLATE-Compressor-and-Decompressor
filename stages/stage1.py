@@ -7,7 +7,7 @@
 # themselves. This is the first stage of the DEFLATE compression pipeline.
 
 import os
-from utilities import *
+from utilities.util_1 import *
 
 def stage1compress(data):
     """
