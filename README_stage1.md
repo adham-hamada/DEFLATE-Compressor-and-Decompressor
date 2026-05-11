@@ -89,7 +89,7 @@ Instead of storing 9 bytes, we store 3 literals and one compact pointer. The dec
 
 ## Key Parameters and Why They Matter
 
-These constants are defined in `utilities.py`:
+These constants are defined in `utilities/util_1.py`:
 
 | Constant | Value | Purpose |
 |---|---|---|
@@ -146,14 +146,14 @@ table = {}
 3. Look it up in the table to get all positions where "ABC" appeared before
 4. After processing a position, add it to the table for future lookups
 
-### 2. The Sliding Window (`sliding_window` in utilities.py)
+### 2. The Sliding Window (`sliding_window` in utilities/util_1.py)
 
 ```python
 sliding_window = np.zeros(WINDOW_SIZE, dtype=np.uint8)  # 32,768 bytes
 current_pos = 0
 ```
 
-**What it is:** A circular buffer (ring buffer) of 32,768 bytes that tracks the most recently processed bytes. Managed in `utilities.py`.
+**What it is:** A circular buffer (ring buffer) of 32,768 bytes that tracks the most recently processed bytes. Managed in `utilities/util_1.py`.
 
 **Why it's circular:** When `current_pos` reaches 32,768, it wraps back to 0 using modulo: `current_pos = (current_pos + 1) % WINDOW_SIZE`. Old data gets overwritten, which is fine because we only look back up to `WINDOW_SIZE` bytes.
 
