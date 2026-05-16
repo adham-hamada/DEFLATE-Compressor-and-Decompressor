@@ -2,6 +2,7 @@
 #========Stage 1: LZ77 Compression=============
 #==============================================
 
+
 WINDOW_SIZE = 32768
 MIN_MATCH = 3
 MAX_MATCH = 258
@@ -400,16 +401,185 @@ def compress(data):
 
     return stage4_compress(s3_compressed, lit_codes, dist_codes)
 
+#==============================================================
+#========Stage 5: Decompression================================
+#==============================================================
+
+class BitReader:
+    """
+    Reads bits one at a time from a byte string, MSB first.
+    This is the exact mirror of BitWriter.
+    """
+
+    def __init__(self, data):
+        self.data         = data  # the full compressed bytes
+        self.byte_pos     = 0     # index of the next byte to load
+        self.bits_in_byte = 0     # unread bits left in current_byte
+        self.current_byte = 0     # the byte we are currently pulling bits from
+
+    def read_bit(self):
+        """Read and return exactly one bit (0 or 1)."""
+        # If the current byte is exhausted, load the next one
+        if self.bits_in_byte == 0:
+            self.current_byte = self.data[self.byte_pos]
+            self.byte_pos    += 1
+            self.bits_in_byte = 8
+        # Pull the most-significant remaining bit
+        self.bits_in_byte -= 1
+        return (self.current_byte >> self.bits_in_byte) & 1
+
+    def read_bits(self, n):
+        """Read n bits and return them as an integer (MSB first)."""
+        value = 0
+        for _ in range(n):
+            value = (value << 1) | self.read_bit()
+        return value
+
+
+def build_decode_table(lengths):
+    """
+    Given lengths[symbol] = code_length for every symbol,
+    rebuild the canonical Huffman codes and return a lookup dict:
+
+        (code_integer, num_bits)  ->  symbol
+
+    This uses the identical algorithm as get_huffman_codes() in the
+    compressor, so the codes produced here are guaranteed to match.
+    """
+    # Step 1: count symbols at each length
+    count = [0] * 16
+    for length in lengths:
+        count[length] += 1
+    count[0] = 0
+
+    # Step 2: first code for each length
+    next_code = [0] * 16
+    code = 0
+    for bits in range(1, 16):
+        code = (code + count[bits - 1]) << 1
+        next_code[bits] = code
+
+    # Step 3: assign codes in symbol order, store reversed for decoding
+    code_to_symbol = {}
+    for symbol in range(len(lengths)):
+        length = lengths[symbol]
+        if length != 0:
+            code_to_symbol[(next_code[length], length)] = symbol
+            next_code[length] += 1
+
+    return code_to_symbol
+
+
+def decode_symbol(reader, code_to_symbol):
+    """
+    Read bits one at a time, accumulating them into `code`.
+    After each new bit check whether (code, bits_read) is a known entry.
+    The first hit is our symbol — prefix-free codes guarantee no valid
+    code is a prefix of another, so the first match is always correct.
+    """
+    code      = 0
+    bits_read = 0
+    while True:
+        code       = (code << 1) | reader.read_bit()
+        bits_read += 1
+        symbol = code_to_symbol.get((code, bits_read))
+        if symbol is not None:
+            return symbol
+
+
+def decompress(compressed_data):
+    """
+    Decompress bytes produced by compress().
+
+    Mirrors the compressor in reverse:
+      1. Read LIT_BW and DIST_BW  (first 8 bits = 1 byte)
+      2. Read 286 literal/length code lengths
+      3. Read 30 distance code lengths
+      4. Rebuild Huffman lookup tables from those lengths
+      5. Decode payload symbols until EndEvent(256)
+         - symbol 0-255   -> emit that byte directly
+         - symbol 256     -> stop
+         - symbol 257-285 -> read extra bits + distance symbol + extra bits,
+                             then copy bytes from earlier in the output
+    """
+    reader = BitReader(compressed_data)
+
+    # ── Step 1: Read the two 4-bit bit-widths from the header ─
+    lit_bw  = reader.read_bits(4)
+    dist_bw = reader.read_bits(4)
+
+    # ── Step 2: Read literal/length code-length table ─────────
+    # 286 entries; entry i = how many bits the code for symbol i uses
+    lit_lengths = []
+    for _ in range(286):
+        if lit_bw == 0:
+            lit_lengths.append(0)          # no lit codes at all (shouldn't happen)
+        else:
+            lit_lengths.append(reader.read_bits(lit_bw))
+
+    # ── Step 3: Read distance code-length table ───────────────
+    # 30 entries; if dist_bw == 0 there are no distance symbols (pure literals)
+    dist_lengths = []
+    for _ in range(30):
+        if dist_bw == 0:
+            dist_lengths.append(0)
+        else:
+            dist_lengths.append(reader.read_bits(dist_bw))
+
+    # ── Step 4: Rebuild canonical Huffman lookup tables ────────
+    # The compressor stored only lengths.  Because canonical Huffman is
+    # deterministic, the same lengths always produce the same codes.
+    lit_codes  = build_decode_table(lit_lengths)
+    dist_codes = build_decode_table(dist_lengths)
+
+    # ── Step 5: Decode the payload ────────────────────────────
+    output = bytearray()
+
+    while True:
+
+        # Read one literal/length symbol
+        symbol = decode_symbol(reader, lit_codes)
+
+        if 0 <= symbol <= 255:
+            # ── Case A: literal byte ──────────────────────────
+            # The symbol value IS the byte — write it straight out
+            output.append(symbol)
+
+        elif symbol == 256:
+            # ── Case B: end marker ────────────────────────────
+            break
+
+        else:
+            # ── Case C: match — symbol 257-285 ───────────────
+
+            # Decode the exact match length
+            # symbol 257 = index 0, symbol 258 = index 1, etc.
+            idx              = symbol - 257
+            base_len         = length_base[idx]
+            num_len_extra    = length_extra[idx]
+            len_extra_val    = reader.read_bits(num_len_extra) if num_len_extra > 0 else 0
+            actual_length    = base_len + len_extra_val
+
+            # Decode the exact match distance
+            dist_symbol      = decode_symbol(reader, dist_codes)
+            base_dist        = distance_base[dist_symbol]
+            num_dist_extra   = distance_extra[dist_symbol]
+            dist_extra_val   = reader.read_bits(num_dist_extra) if num_dist_extra > 0 else 0
+            actual_distance  = base_dist + dist_extra_val
+
+            # LZ77 copy — byte by byte so overlapping matches work correctly
+            # e.g. distance=1, length=9 repeats the last byte 9 times
+            for _ in range(actual_length):
+                copy_pos = len(output) - actual_distance
+                output.append(output[copy_pos])
+
+    return bytes(output)
+
 
 #==============================================================
 #========CLI Entry Point=======================================
 #==============================================================
- 
-# FIX Bug 3: The original __main__ only ran a hardcoded test and had no
-# argument handling.  The spec requires:
-#   python main.py -c <file>   → compress, write <file>.sdfl
-#   python main.py -d <file>   → decompress, write original filename
- 
+
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == '-c':
         input_path  = sys.argv[2]
@@ -419,67 +589,51 @@ if __name__ == "__main__":
         compressed = compress(data)
         with open(output_path, 'wb') as f:
             f.write(compressed)
-        print(f"Compressed '{input_path}' → '{output_path}' "
-              f"({len(data)} bytes → {len(compressed)} bytes)")
- 
+        print(f"Compressed '{input_path}' -> '{output_path}' "
+              f"({len(data)} bytes -> {len(compressed)} bytes)")
+
     elif len(sys.argv) == 3 and sys.argv[1] == '-d':
         input_path = sys.argv[2]
         if not input_path.endswith('.sdfl'):
-            print("Error: file to decompress must have .sdfl extension", file=sys.stderr)
+            print("Error: file to decompress must end with .sdfl", file=sys.stderr)
             sys.exit(1)
-        output_path = input_path[:-5]   # strip '.sdfl'
+        output_path = input_path[:-5]
         with open(input_path, 'rb') as f:
             data = f.read()
-        # Decompressor will be implemented in a later stage
-        raise NotImplementedError("Decompression (Stage 5) not yet implemented.")
- 
+        decompressed = decompress(data)
+        with open(output_path, 'wb') as f:
+            f.write(decompressed)
+        print(f"Decompressed '{input_path}' -> '{output_path}' "
+              f"({len(data)} bytes -> {len(decompressed)} bytes)")
+
     else:
-        # ── Developer smoke-test (no arguments) ──────────────
         print("Usage: python main.py -c <file>  |  python main.py -d <file>.sdfl")
         print()
- 
-        data = b"abcabcabcabc"
-        s1 = stage1compress(data)
-        print("Stage 1:")
-        for item in s1:
-            if item[0] == 'literal':
-                print(f"  Literal({item[1]})")
-            else:
-                print(f"  Match(length={item[1]}, distance={item[2]})")
- 
-        s2 = stage2_compress(data)
-        print("\nStage 2:")
-        for item in s2:
-            if item[0] == 'literal':
-                print(f"  LiteralEvent({item[1]})")
-            elif item[0] == 'match':
-                print(f"  MatchEvent({item[1]}, \"{item[2]}\", {item[3]}, \"{item[4]}\")")
-            elif item[0] == 'end':
-                print(f"  EndEvent({item[1]})")
- 
-        s3 = stage3_compress(s2)
-        print("\nStage 3:")
-        for item in s3:
-            if item[0] == 'literal':
-                print(f"  LiteralEvent({item[1]}, code={item[2]}, len={item[3]})")
-            elif item[0] == 'match':
-                print(f"  MatchEvent(len_sym={item[1]}, len_extra=\"{item[2]}\", "
-                      f"dist_sym={item[3]}, dist_extra=\"{item[4]}\", "
-                      f"len_code={item[5]}, len_bits={item[6]}, "
-                      f"dist_code={item[7]}, dist_bits={item[8]})")
-            elif item[0] == 'end':
-                print(f"  EndEvent({item[1]}, code={item[2]}, len={item[3]})")
- 
-        lit_freq, dist_freq = get_frequencies(s2)
-        lit_codes  = get_huffman_codes(lit_freq)
-        dist_codes = get_huffman_codes(dist_freq)
-        compressed = stage4_compress(s3, lit_codes, dist_codes)
- 
-        print(f"\nStage 4:")
-        print(f"  Input : {data}")
-        print(f"  Output: {compressed.hex()}")
-        print(f"  Bytes : {len(compressed)} (input was {len(data)})")
- 
-        lit_lengths, dist_lengths = get_code_length_tables(lit_codes, dist_codes)
-        print(f"  LIT_BW={compute_bit_width(lit_lengths)}, "
-              f"DIST_BW={compute_bit_width(dist_lengths)}")
+        print("Running round-trip tests...\n")
+
+        tests = [
+            (b"abcabcabcabc",               "spec example"),
+            (b"ABABABABABABABABABABABABABAB", "alternating pattern"),
+            (b"hello world",                "pure literals, no matches"),
+            (b"aaaaaaaaaa",                 "single repeated byte"),
+            (b"abcdefghij",                 "all unique bytes"),
+            (b"a" * 200,                    "long repetition"),
+            (b"abcdef" * 50,                "medium repetition"),
+            (bytes(range(256)),             "all 256 byte values"),
+        ]
+
+        all_passed = True
+        for original, label in tests:
+            compressed   = compress(original)
+            decompressed = decompress(compressed)
+            ok = (decompressed == original)
+            if not ok:
+                all_passed = False
+            status = "PASS" if ok else "FAIL"
+            print(f"  [{status}] {label}")
+            print(f"         original={len(original)}B  "
+                  f"compressed={len(compressed)}B  "
+                  f"decompressed={len(decompressed)}B")
+
+        print()
+        print("All tests passed!" if all_passed else "SOME TESTS FAILED.")
