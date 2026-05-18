@@ -1,178 +1,91 @@
-# DEFLATE Decompressor
+# DEFLATE Compressor & Decompressor
 
-A single-pass decompressor that reverses the 4-stage DEFLATE compression pipeline, reconstructing the original data from a `.sdfl` compressed file. Fully documented for educational purposes.
-
----
-
-## How Decompression Works
-
-The compressor transforms data through 4 stages:
-
-```
-Raw bytes → LZ77 → DEFLATE Symbols → Huffman Coding → Bitstream
-```
-
-The decompressor **reverses the entire pipeline in a single pass** — it reads the bitstream left-to-right, rebuilds the Huffman tables from the header, and decodes symbols back into the original bytes on the fly:
-
-```
-Bitstream → Huffman Decoding → Symbol Interpretation → LZ77 Replay → Raw bytes
-```
-
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│                    Decompression Pipeline                            │
-│                                                                      │
-│  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐        │
-│  │ Step 1   │───▶│ Step 2-3 │───▶│ Step 4   │───▶│ Step 5   │        │
-│  │ Read     │    │ Read     │    │ Rebuild  │    │ Decode   │        │
-│  │ Header   │    │ Code     │    │ Huffman  │    │ Payload  │        │
-│  │ Widths   │    │ Lengths  │    │ Tables   │    │ Symbols  │        │
-│  └──────────┘    └──────────┘    └──────────┘    └──────────┘        │
-│                                                                      │
-│  Compressed bytes ──▶ Code lengths ──▶ Lookup tables ──▶ Raw bytes   │
-└──────────────────────────────────────────────────────────────────────┘
-```
+A from-scratch implementation of the DEFLATE compression algorithm (RFC 1951), built as a modular 4-stage pipeline for educational purposes. Compresses any file into a custom `.sdfl` format and decompresses it back to the original.
 
 ---
 
-## Step-by-Step Breakdown
+## Usage
 
-### Step 1 — Read Header Bit-Widths
+```bash
+# Compress a file → creates <filename>.sdfl
+python3 main.py -c <filename>
 
-**Goal:** Learn how many bits each code-length entry uses.
-
-The first byte of the compressed stream contains two 4-bit values packed together:
-
-| Field | Bits | Meaning |
-|---|---|---|
-| `LIT_BW` | 4 | Bits per literal/length code-length entry |
-| `DIST_BW` | 4 | Bits per distance code-length entry |
-
-These tell the decompressor the fixed width used to store each entry in the code-length tables that follow.
-
-```
-Byte 0:  [ LIT_BW (4 bits) | DIST_BW (4 bits) ]
+# Decompress a .sdfl file → restores the original
+python3 main.py -d <filename>.sdfl
 ```
 
-**Example:** If `LIT_BW = 4` and `DIST_BW = 3`, then each literal code-length is stored in 4 bits and each distance code-length in 3 bits.
+**Example:**
+
+```bash
+python3 main.py -c data/data_2.txt        # → data/data_2.txt.sdfl
+python3 main.py -d data/data_2.txt.sdfl   # → data/data_2.txt
+```
+
+No external dependencies — runs on Python 3 standard library only.
 
 ---
 
-### Steps 2–3 — Read Code-Length Tables
+## How It Works
 
-**Goal:** Reconstruct the Huffman code lengths for every symbol.
-
-Immediately after the header, the bitstream contains two tables of code lengths:
-
-| Table | Entries | Purpose |
-|---|---|---|
-| Literal/Length | 286 | Code lengths for symbols 0–285 (literals 0–255, end-of-block 256, length codes 257–285) |
-| Distance | 30 | Code lengths for distance symbols 0–29 |
-
-Each entry is read as a fixed-width integer using `LIT_BW` or `DIST_BW` bits respectively. A code length of 0 means that symbol does not appear in the compressed data.
+DEFLATE combines **LZ77** (pattern matching) and **Huffman coding** (entropy coding) to compress data losslessly. This implementation splits the algorithm into 4 clear stages:
 
 ```
-Header:  [LIT_BW][DIST_BW]
-         ├── 286 × LIT_BW bits ──┤── 30 × DIST_BW bits ──┤
-         │   lit_lengths[0..285]  │  dist_lengths[0..29]   │
+Raw bytes ──▶ Stage 1 ──▶ Stage 2 ──▶ Stage 3 ──▶ Stage 4 ──▶ Compressed bytes
+              LZ77       DEFLATE     Huffman     Bitstream
+                         Symbols     Coding      Packing
 ```
 
-**Special case:** If `DIST_BW = 0`, the compressed data contains only literal bytes (no LZ77 matches were found).
+Decompression reverses the entire pipeline in a single pass.
 
 ---
 
-### Step 4 — Rebuild Canonical Huffman Tables
+## Compression Pipeline
 
-**Goal:** Turn code lengths into a lookup table for bit-by-bit decoding.
+### Stage 1 — LZ77 Compression
 
-Because the compressor uses **canonical Huffman codes**, the code lengths alone are sufficient to reconstruct the exact same codes — no tree structure needs to be transmitted. The algorithm:
+Slides a 32 KB window over the input, replacing repeated byte sequences with back-references `(length, distance)`. Unique bytes pass through as literals.
 
-1. **Count** how many symbols have each code length
-2. **Compute** the first code value for each length (starting from the shortest)
-3. **Assign** codes to symbols in ascending symbol order within each length group
-
-The result is a lookup dictionary mapping `(code_integer, num_bits) → symbol`.
-
-| What the compressor stored | What the decompressor rebuilds |
+| Input | Output |
 |---|---|
-| `lengths = [0, 0, ..., 3, 4, 3, ...]` | `{(0b010, 3): 32, (0b0110, 4): 101, ...}` |
+| `ABCABCABC` (9 bytes) | `L(A) L(B) L(C) M(6,3)` — 3 literals + 1 match |
 
-**Why canonical codes work:** Given the same set of code lengths, there is exactly one valid assignment of binary codes. Both compressor and decompressor independently produce identical codes from the same lengths — no explicit code table needs to be transmitted.
+**Files:** `stages/stage1.py`, `stages/utilities/util_1.py`
 
-**Files:** `stages/utilities/util_decompressor.py` → `build_decode_table()`
+### Stage 2 — DEFLATE Symbol Encoding
+
+Converts raw lengths (3–258) and distances (1–32768) into compact symbol codes + extra bits, reducing the alphabet to 29 length symbols and 30 distance symbols.
+
+**Files:** `stages/stage2.py`, `stages/utilities/util_2.py`
+
+### Stage 3 — Canonical Huffman Coding
+
+Builds frequency-optimal binary codes: frequent symbols get short codes, rare ones get long codes. Uses canonical form so only code *lengths* are needed to reconstruct the codes.
+
+**Files:** `stages/stage3.py`, `stages/utilities/util_3.py`
+
+### Stage 4 — Bitstream Packing
+
+Writes a header (Huffman code-length tables) followed by the payload (Huffman codes + extra bits) packed tightly into bytes.
+
+```
+Header:  [LIT_BW 4b][DIST_BW 4b][286 × LIT_BW bits][30 × DIST_BW bits]
+Payload: [Huffman codes + extra bits ... Huffman(256) end marker] [padding]
+```
+
+**Files:** `stages/stage4.py`, `stages/utilities/util_4.py`
 
 ---
 
-### Step 5 — Decode Payload Symbols
+## Decompression
 
-**Goal:** Read Huffman-coded symbols from the bitstream and reconstruct the original data.
+The decompressor reads the `.sdfl` bitstream in a single pass:
 
-The decompressor reads bits one at a time, accumulating them into a code. After each bit, it checks the Huffman lookup table — prefix-free codes guarantee the first match is always correct.
+1. Read `LIT_BW` and `DIST_BW` from the header (8 bits)
+2. Read 286 literal/length code lengths + 30 distance code lengths
+3. Rebuild canonical Huffman lookup tables from the lengths
+4. Decode symbols until end-of-block (256): literals are emitted directly, matches copy from the output buffer
 
-Each decoded symbol falls into one of three cases:
-
-#### Case A: Literal (symbol 0–255)
-
-The symbol value **is** the byte. Write it directly to the output buffer.
-
-```
-Symbol 65  →  output.append(65)  →  byte 'A'
-```
-
-#### Case B: End-of-Block (symbol 256)
-
-Stop decoding. The compressed stream is complete.
-
-#### Case C: LZ77 Match (symbol 257–285)
-
-The symbol encodes a **back-reference**: copy bytes from earlier in the output buffer.
-
-Decoding a match requires reading 4 pieces of information:
-
-| Piece | Source | Purpose |
-|---|---|---|
-| Length symbol | Huffman-decoded from lit/length table | Base index into length lookup table |
-| Length extra bits | Raw bits from stream | Fine-tune the exact length within the range |
-| Distance symbol | Huffman-decoded from distance table | Base index into distance lookup table |
-| Distance extra bits | Raw bits from stream | Fine-tune the exact distance within the range |
-
-```
-length  = length_base[symbol - 257]  + read_bits(length_extra[symbol - 257])
-distance = distance_base[dist_symbol] + read_bits(distance_extra[dist_symbol])
-```
-
-Then copy `length` bytes starting from `output[-distance]`:
-
-```
-output = "ABCABC"
-Match: length=3, distance=6  →  copy output[-6], output[-5], output[-4]  →  "ABC"
-Result: "ABCABCABC"
-```
-
-**Overlapping matches:** The copy is done byte-by-byte so that matches with `distance < length` work correctly. For example, `distance=1, length=5` repeats the last byte 5 times — each copied byte becomes available for the next copy.
-
-**Files:** `stages/utilities/util_decompressor.py` → `decode_symbol()`, `stages/utilities/util_2.py` → `length_base`, `length_extra`, `distance_base`, `distance_extra`
-
----
-
-## Utilities
-
-### `util_decompressor.py`
-
-| Component | Purpose |
-|---|---|
-| `BitReader` | Reads bits one at a time from a byte string (MSB first). Mirror of the compressor's `BitWriter`. |
-| `build_decode_table(lengths)` | Rebuilds canonical Huffman codes from code lengths. Returns `{(code, bits): symbol}` lookup dict. |
-| `decode_symbol(reader, table)` | Reads bits from the stream, accumulating into a code, until a valid Huffman symbol is matched. |
-
-### `util_2.py` (shared with compressor)
-
-| Component | Purpose |
-|---|---|
-| `length_base[29]` | Base match length for each length symbol (257–285). E.g. symbol 257 → length 3. |
-| `length_extra[29]` | Number of extra bits for each length symbol. E.g. symbol 265 → 1 extra bit. |
-| `distance_base[30]` | Base distance for each distance symbol (0–29). E.g. symbol 0 → distance 1. |
-| `distance_extra[30]` | Number of extra bits for each distance symbol. E.g. symbol 4 → 1 extra bit. |
+**Files:** `decompressor.py`, `stages/utilities/util_decompressor.py`
 
 ---
 
@@ -180,60 +93,58 @@ Result: "ABCABCABC"
 
 ```
 DEFLATE-Compressor-and-Decompressor/
+├── main.py                       ← CLI entry point (-c / -d)
 ├── compressor.py                 ← 4-stage compression pipeline
-├── decompressor.py               ← Single-pass decompression (this README)
-├── README_compressor.md          ← Compressor documentation
-├── README_decompressor.md        ← You are here
-├── data/
-│   └── data_2.txt                ← Sample test data
-└── stages/
-    └── utilities/
-        ├── util_2.py             ← Length/distance lookup tables (shared)
-        └── util_decompressor.py  ← BitReader, Huffman decode helpers
+├── decompressor.py               ← Single-pass decompression
+├── README.md                     ← This file
+├── documentation/
+│   ├── compressor.md             ← Compressor architecture overview
+│   ├── decompressor.md           ← Decompressor architecture overview
+│   ├── stage1.md                 ← LZ77 detailed documentation
+│   ├── stage2.md                 ← DEFLATE symbols documentation
+│   ├── stage3.md                 ← Huffman coding documentation
+│   └── stage4.md                 ← Bitstream packing documentation
+├── stages/
+│   ├── stage1.py                 ← LZ77 compression
+│   ├── stage2.py                 ← DEFLATE symbol encoding
+│   ├── stage3.py                 ← Canonical Huffman coding
+│   ├── stage4.py                 ← Bitstream packing
+│   └── utilities/
+│       ├── util_1.py             ← Sliding window, constants
+│       ├── util_2.py             ← Length/distance lookup tables
+│       ├── util_3.py             ← Huffman tree building
+│       ├── util_4.py             ← BitWriter, header helpers
+│       └── util_decompressor.py  ← BitReader, Huffman decode helpers
+└── data/
+    ├── data_1.txt                ← Small test file (377 B)
+    └── data_2.txt                ← Larger test file (~1 MB)
 ```
 
 ---
 
-## Quick Start
+## Documentation
 
-```bash
-# Step 1: Compress a file first (creates data_2.txt.sdfl)
-python3 compressor.py
+Each stage has a dedicated document with full explanations, diagrams, and worked examples:
 
-# Step 2: Decompress and verify integrity
-python3 decompressor.py
-```
-
-Expected output:
-
-```
-============================================================
-  DEFLATE Decompression Demo — data_2.txt.sdfl
-  Compressed size: XXX bytes (X.X KB)
-============================================================
-
-────────────────────────────────────────────────────────────
-  Decompression Results
-────────────────────────────────────────────────────────────
-  Compressed   : XXX bytes
-  Decompressed : XXX bytes
-  Original     : XXX bytes
-  Integrity    : PASS
-============================================================
-```
+| Document | Topic |
+|---|---|
+| [compressor.md](documentation/compressor.md) | Compressor pipeline overview |
+| [decompressor.md](documentation/decompressor.md) | Decompressor pipeline overview |
+| [stage1.md](documentation/stage1.md) | LZ77 — sliding window, match finding |
+| [stage2.md](documentation/stage2.md) | DEFLATE symbols — length/distance tables, extra bits |
+| [stage3.md](documentation/stage3.md) | Canonical Huffman — tree building, code assignment |
+| [stage4.md](documentation/stage4.md) | Bitstream — header format, bit packing |
 
 ---
 
-## Compressor vs. Decompressor
+## Results
 
-| Aspect | Compressor | Decompressor |
-|---|---|---|
-| Stages | 4 separate stages | Single pass |
-| Huffman | Builds tree from frequencies | Rebuilds from stored code lengths |
-| LZ77 | Searches for matches in sliding window | Replays matches from output buffer |
-| Output | Compressed `.sdfl` bytes | Original raw bytes |
-| Complexity | O(n × w) where w = window size | O(n) linear scan |
+Tested on `data_2.txt` (~1 MB):
 
-The decompressor is simpler because it doesn't need to search — the compressor already did the hard work of finding patterns and building optimal codes. The decompressor just follows the instructions encoded in the bitstream.
-
----
+| Metric | Value |
+|---|---|
+| Original size | 1,009,152 B |
+| Compressed size | 57,277 B |
+| Compression ratio | 5.7% |
+| Compression time | ~3.8 s |
+| Decompression time | ~0.2 s |
