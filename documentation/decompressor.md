@@ -20,7 +20,7 @@ Bitstream → Huffman Decoding → Symbol Interpretation → LZ77 Replay → Raw
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│                    Decompression Pipeline                            │
+│                    Decompression Pipeline                             │
 │                                                                      │
 │  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐        │
 │  │ Step 1   │───▶│ Step 2-3 │───▶│ Step 4   │───▶│ Step 5   │        │
